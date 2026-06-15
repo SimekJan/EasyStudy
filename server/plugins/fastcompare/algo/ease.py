@@ -100,3 +100,4 @@ class EASE(AlgorithmBase, ABC):
                 help="Threshold for conversion of n-ary rating into binary (positive/negative).",
             ),
         ]
+

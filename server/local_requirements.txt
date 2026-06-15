@@ -17,3 +17,4 @@ gunicorn
 cinemagoer
 pytest
 requests
+torch
