@@ -1,19 +1,21 @@
 import numpy as np
-
 from abc import ABC
+
+import torch
+import torch.nn as nn
+
 from plugins.fastcompare.algo.algorithm_base import (
     AlgorithmBase,
     Parameter,
     ParameterType,
 )
 
-import torch
-import torch.nn as nn
-
 
 class NCF(AlgorithmBase, ABC):
 
-    def __init__(self, loader, positive_threshold, emb_dim=32, lr=1e-3, epochs=10, **kwargs):
+    def __init__(self, loader, positive_threshold, emb_dim=16, lr=1e-3, epochs=5, device=None, **kwargs):
+
+        print("_____INITIALIZING_MODEL_____", flush=True)
 
         self._loader = loader
         self._ratings_df = loader.ratings_df
@@ -23,10 +25,9 @@ class NCF(AlgorithmBase, ABC):
         self._lr = lr
         self._epochs = epochs
 
-        # EASE-style item universe (optional, mostly for consistency/debugging)
-        self._all_items = self._ratings_df.item.unique()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Build rating matrix (EASE-style preprocessing)
+        # --- build matrix once ---
         self._rating_matrix = (
             self._ratings_df
             .pivot(index="user", columns="item", values="rating")
@@ -37,12 +38,15 @@ class NCF(AlgorithmBase, ABC):
         self._num_users, self._num_items = self._rating_matrix.shape
 
         self._build_model()
+        self._prepare_data()
 
     # ---------------- MODEL ----------------
     def _build_model(self):
 
-        self.user_emb = nn.Embedding(self._num_users, self._emb_dim)
-        self.item_emb = nn.Embedding(self._num_items, self._emb_dim)
+        print("_____BUILDING_MODEL_____", flush=True)
+
+        self.user_emb = nn.Embedding(self._num_users, self._emb_dim).to(self.device)
+        self.item_emb = nn.Embedding(self._num_items, self._emb_dim).to(self.device)
 
         self.mlp = nn.Sequential(
             nn.Linear(self._emb_dim * 2, 64),
@@ -50,135 +54,154 @@ class NCF(AlgorithmBase, ABC):
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
-        )
+        ).to(self.device)
 
-        self.sigmoid = nn.Sigmoid()
-
-        params = (
-            list(self.user_emb.parameters()) +
-            list(self.item_emb.parameters()) +
-            list(self.mlp.parameters())
-        )
-
-        self.optimizer = torch.optim.Adam(params, lr=self._lr)
         self.loss_fn = nn.BCELoss()
+
+        params = list(self.user_emb.parameters()) + list(self.item_emb.parameters()) + list(self.mlp.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=self._lr)
+
+    # ---------------- DATA PREP ----------------
+    def _prepare_data(self):
+
+        print("_____PREPATING_DATA_____", flush=True)
+
+        X = (self._rating_matrix >= self._threshold).astype(np.int32)
+
+        self.user_pos = {}
+        self.train_users = []
+        self.train_items = []
+        self.train_labels = []
+
+        all_items = np.arange(self._num_items)
+
+        for u in range(self._num_users):
+
+            pos_items = np.where(X[u] == 1)[0]
+
+            if len(pos_items) == 0:
+                continue
+
+            self.user_pos[u] = pos_items
+
+            for i in pos_items:
+
+                # positive sample
+                self.train_users.append(u)
+                self.train_items.append(i)
+                self.train_labels.append(1.0)
+
+                # fast negative sampling (vectorized)
+                neg = np.random.choice(all_items)
+                while neg in pos_items:
+                    neg = np.random.choice(all_items)
+
+                self.train_users.append(u)
+                self.train_items.append(neg)
+                self.train_labels.append(0.0)
+
+        # convert to tensors once
+        self.train_users = torch.tensor(self.train_users, dtype=torch.long, device=self.device)
+        self.train_items = torch.tensor(self.train_items, dtype=torch.long, device=self.device)
+        self.train_labels = torch.tensor(self.train_labels, dtype=torch.float32, device=self.device)
 
     # ---------------- TRAINING ----------------
     def fit(self):
 
-        # EASE-style binarization
-        X = (self._rating_matrix >= self._threshold).astype(np.float32)
+        batch_size = 8192
 
-        user_pos = {
-            u: set(np.where(X[u] == 1)[0])
-            for u in range(self._num_users)
-        }
+        n = len(self.train_users)
 
         for epoch in range(self._epochs):
 
-            print(f"Epoch {epoch} started")
+            print(f"_____STARTING_EPOCH_{epoch}_____", flush=True)
 
-            total_loss = 0.0
+            self.user_emb.train()
+            self.item_emb.train()
+            self.mlp.train()
 
-            for u in range(self._num_users):
+            epoch_loss = 0.0
+            total_samples = 0          # ← ADD
 
-                if u % 100 == 0:
-                    print(f"user {u}/{self._num_users}")
+            for start in range(0, n, batch_size):
 
-                pos_items = user_pos[u]
+                end = min(start + batch_size, n)
 
-                if len(pos_items) == 0:
-                    continue
+                users = self.train_users[start:end]
+                items = self.train_items[start:end]
+                labels = self.train_labels[start:end]
 
-                for i in pos_items:
+                pred = self.forward(users, items)
 
-                    # positive sample
-                    total_loss += self._train_step(u, i, 1.0)
+                loss = self.loss_fn(pred, labels)
 
-                    # negative sample
-                    j = self._sample_negative(pos_items)
-                    total_loss += self._train_step(u, j, 0.0)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
-            print(f"Epoch {epoch}: {total_loss:.4f}")
+                epoch_loss += loss.item() * len(users)
+                total_samples += len(users)
 
-    def _train_step(self, user, item, label):
+                # progress every ~100 batches
+                if start % (batch_size * 100) == 0:
+                    print(
+                        f"{start}/{n}",
+                        flush=True
+                    )
 
-        u = torch.tensor([user], dtype=torch.long)
-        i = torch.tensor([item], dtype=torch.long)
-        y = torch.tensor([label], dtype=torch.float32)
+            avg_loss = epoch_loss / total_samples
 
-        pred = self.forward(u, i)
-        loss = self.loss_fn(pred, y)
+            print(
+                f"Epoch {epoch} | avg_loss = {avg_loss:.4f}",
+                flush=True
+            )
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        return loss.item()
-
-    def _sample_negative(self, pos_items):
-
-        while True:
-            j = np.random.randint(self._num_items)
-            if j not in pos_items:
-                return j
+        print("Training finished", flush=True)
 
     # ---------------- FORWARD ----------------
-    def forward(self, user, item):
+    def forward(self, users, items):
 
-        u = self.user_emb(user)
-        i = self.item_emb(item)
+        u = self.user_emb(users)
+        i = self.item_emb(items)
 
         x = torch.cat([u, i], dim=-1)
         x = self.mlp(x)
 
-        return self.sigmoid(x).view(-1)
+        return torch.sigmoid(x).squeeze(-1)
 
     # ---------------- PREDICTION ----------------
     def predict(self, selected_items, filter_out_items, k):
 
+        print("_____CALLING_PREDICT_____", flush=True)
+
         selected_items = list(selected_items)
         filter_out_items = set(filter_out_items)
 
-        # candidate filtering (EASE-consistent)
         candidates = np.setdiff1d(
             np.arange(self._num_items),
             np.union1d(selected_items, list(filter_out_items))
         )
 
-        # cold-start fallback (EASE behavior)
         if len(selected_items) == 0:
-            if len(candidates) == 0:
-                return []
-
-            return np.random.choice(
-                candidates,
-                size=min(k, len(candidates)),
-                replace=False
-            ).tolist()
+            return np.random.choice(candidates, size=min(k, len(candidates)), replace=False).tolist()
 
         with torch.no_grad():
 
-            item_vecs = self.item_emb(torch.tensor(candidates, dtype=torch.long))
-            selected_vecs = self.item_emb(torch.tensor(selected_items, dtype=torch.long))
+            user_vec = self.item_emb(torch.tensor(selected_items, device=self.device)).mean(dim=0)
+            item_vecs = self.item_emb(torch.tensor(candidates, device=self.device))
 
-            user_vec = selected_vecs.mean(dim=0)
+            # vectorized scoring (FAST)
+            x = torch.cat([
+                user_vec.unsqueeze(0).expand(len(candidates), -1),
+                item_vecs
+            ], dim=1)
 
-            scores = []
+            scores = self.mlp(x).squeeze(-1)
+            scores = torch.sigmoid(scores)
 
-            for idx, item in enumerate(candidates):
+            topk = torch.topk(scores, k=min(k, len(candidates))).indices.cpu().numpy()
 
-                x = torch.cat([
-                    user_vec.unsqueeze(0),
-                    item_vecs[idx].unsqueeze(0)
-                ], dim=-1)
-
-                score = self.sigmoid(self.mlp(x)).item()
-                scores.append((score, int(item)))
-
-        scores.sort(reverse=True, key=lambda x: x[0])
-
-        return [item for _, item in scores[:k]]
+        return candidates[topk].tolist()
 
     # ---------------- METADATA ----------------
     @classmethod
@@ -188,28 +211,8 @@ class NCF(AlgorithmBase, ABC):
     @classmethod
     def parameters(cls):
         return [
-            Parameter(
-                "emb_dim",
-                ParameterType.INT,
-                32,
-                help="Dimensionality of embeddings",
-            ),
-            Parameter(
-                "lr",
-                ParameterType.FLOAT,
-                0.001,
-                help="Learning rate for optimizer",
-            ),
-            Parameter(
-                "epochs",
-                ParameterType.INT,
-                10,
-                help="Number of training epochs",
-            ),
-            Parameter(
-                "positive_threshold",
-                ParameterType.FLOAT,
-                2.5,
-                help="Threshold for converting ratings into implicit feedback",
-            ),
+            Parameter("emb_dim", ParameterType.INT, 16),
+            Parameter("lr", ParameterType.FLOAT, 0.001),
+            Parameter("epochs", ParameterType.INT, 5),
+            Parameter("positive_threshold", ParameterType.FLOAT, 2.5),
         ]
