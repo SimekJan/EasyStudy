@@ -29,7 +29,6 @@ class NCF(AlgorithmBase, ABC):
         self._loader = loader
         self._ratings_df = loader.ratings_df
 
-        # ---------------- SAFE INDEXING ----------------
         self._users = self._ratings_df.user.unique()
         self._items = self._ratings_df.item.unique()
 
@@ -55,12 +54,15 @@ class NCF(AlgorithmBase, ABC):
 
         print("_____BUILDING_MODEL_____", flush=True)
 
+        # GMF embeddings
         self.gmf_user_emb = nn.Embedding(self._num_users, self._emb_dim)
         self.gmf_item_emb = nn.Embedding(self._num_items, self._emb_dim)
 
+        # MLP embeddings
         self.mlp_user_emb = nn.Embedding(self._num_users, self._emb_dim)
         self.mlp_item_emb = nn.Embedding(self._num_items, self._emb_dim)
 
+        # MLP tower
         self.mlp = nn.Sequential(
             nn.Linear(self._emb_dim * 2, 64),
             nn.ReLU(),
@@ -68,8 +70,6 @@ class NCF(AlgorithmBase, ABC):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-
-        # NOTE: no self.to(self.device)
 
         params = (
             list(self.gmf_user_emb.parameters()) +
@@ -81,91 +81,113 @@ class NCF(AlgorithmBase, ABC):
 
         self.optimizer = torch.optim.Adam(params, lr=self._lr)
 
-    # ---------------- DATA PREP ----------------
+    # ---------------- DATA ----------------
     def _prepare_data(self):
 
         print("_____PREPARING_DATA_____", flush=True)
 
-        self.train_users = []
-        self.train_pos = []
-        self.train_neg = []
-        self.user_pos = {}
+        self.pos_interactions = []
 
         df = self._ratings_df[["user", "item", "rating"]]
 
         for u_raw, i_raw, r in df.itertuples(index=False):
 
-            if r < self._threshold:
-                continue
-
-            # SAFE mapping
             if u_raw not in self.user2idx or i_raw not in self.item2idx:
                 continue
 
-            u = self.user2idx[u_raw]
-            i = self.item2idx[i_raw]
+            if r >= self._threshold:
+                u = self.user2idx[u_raw]
+                i = self.item2idx[i_raw]
+                self.pos_interactions.append((u, i))
 
-            self.train_users.append(u)
-            self.train_pos.append(i)
-            self.user_pos.setdefault(u, set()).add(i)
+    # ---------------- SCORING (CRITICAL FIX) ----------------
+    def score(self, gmf_u, gmf_i, mlp_u, mlp_i):
 
-        # ---------------- NEGATIVE SAMPLING ----------------
-        all_items = np.arange(self._num_items)
+        gmf_score = (gmf_u * gmf_i).sum(dim=1)
 
-        for u, pos_i in zip(self.train_users, self.train_pos):
+        mlp_in = torch.cat([mlp_u, mlp_i], dim=1)
+        mlp_score = self.mlp(mlp_in).squeeze(-1)
 
-            neg = np.random.randint(self._num_items)
-            # safe fallback (bounded loop)
-            tries = 0
-            while neg in self.user_pos[u] and tries < 20:
-                neg = np.random.randint(self._num_items)
-                tries += 1
+        return gmf_score + mlp_score
 
-            self.train_neg.append(neg)
+    # ---------------- HARD NEGATIVE SAMPLER ----------------
+    def sample_hard_negative(self, u, k=50):
 
-        # tensors
-        self.train_users = torch.tensor(self.train_users, dtype=torch.long, device=self.device)
-        self.train_pos = torch.tensor(self.train_pos, dtype=torch.long, device=self.device)
-        self.train_neg = torch.tensor(self.train_neg, dtype=torch.long, device=self.device)
+        u_tensor = torch.tensor([u], device=self.device)
 
-    # ---------------- FORWARD ----------------
-    def forward(self, users, items):
+        items = torch.randint(0, self._num_items, (k,), device=self.device)
 
-        gmf_u = self.gmf_user_emb(users)
-        gmf_i = self.gmf_item_emb(items)
-        gmf = (gmf_u * gmf_i).sum(dim=1, keepdim=True)
+        with torch.no_grad():
 
-        mlp_u = self.mlp_user_emb(users)
-        mlp_i = self.mlp_item_emb(items)
+            gmf_u = self.gmf_user_emb(u_tensor)
+            mlp_u = self.mlp_user_emb(u_tensor)
 
-        mlp = self.mlp(torch.cat([mlp_u, mlp_i], dim=-1))
+            gmf_i = self.gmf_item_emb(items)
+            mlp_i = self.mlp_item_emb(items)
 
-        return gmf + mlp
+            gmf_score = (gmf_u * gmf_i).sum(dim=1)
+
+            mlp_in = torch.cat([
+                mlp_u.expand(k, -1),
+                mlp_i
+            ], dim=1)
+
+            mlp_score = self.mlp(mlp_in).squeeze(-1)
+
+            scores = gmf_score + mlp_score
+
+        return items[torch.argmax(scores)].item()
 
     # ---------------- TRAIN ----------------
     def fit(self):
 
-        batch_size = 8192
-        n = len(self.train_users)
+        batch_size = 1024
 
         for epoch in range(self._epochs):
 
             print(f"_____STARTING_EPOCH_{epoch}_____", flush=True)
 
+            np.random.shuffle(self.pos_interactions)
+
             epoch_loss = 0.0
 
-            for start in range(0, n, batch_size):
+            for start in range(0, len(self.pos_interactions), batch_size):
 
-                end = min(start + batch_size, n)
+                batch = self.pos_interactions[start:start + batch_size]
 
-                u = self.train_users[start:end]
-                p = self.train_pos[start:end]
-                n_i = self.train_neg[start:end]
+                users = []
+                pos_items = []
+                neg_items = []
 
-                pos_scores = self.forward(u, p)
-                neg_scores = self.forward(u, n_i)
+                for (u, pos_i) in batch:
 
-                loss = -F.logsigmoid(pos_scores - neg_scores).mean()
+                    users.append(u)
+                    pos_items.append(pos_i)
+
+                    neg_i = self.sample_hard_negative(u)
+                    neg_items.append(neg_i)
+
+                u = torch.tensor(users, device=self.device)
+                pi = torch.tensor(pos_items, device=self.device)
+                ni = torch.tensor(neg_items, device=self.device)
+
+                # embeddings
+                gmf_u = self.gmf_user_emb(u)
+
+                gmf_pi = self.gmf_item_emb(pi)
+                gmf_ni = self.gmf_item_emb(ni)
+
+                mlp_u = self.mlp_user_emb(u)
+
+                mlp_pi = self.mlp_item_emb(pi)
+                mlp_ni = self.mlp_item_emb(ni)
+
+                # 🔥 unified scoring (FIXED)
+                pos_score = self.score(gmf_u, gmf_pi, mlp_u, mlp_pi)
+                neg_score = self.score(gmf_u, gmf_ni, mlp_u, mlp_ni)
+
+                # BPR loss
+                loss = -torch.log(torch.sigmoid(pos_score - neg_score)).mean()
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -173,9 +195,7 @@ class NCF(AlgorithmBase, ABC):
 
                 epoch_loss += loss.item()
 
-            print(f"Epoch {epoch} | loss = {epoch_loss:.4f}", flush=True)
-
-        print("Training finished", flush=True)
+            print(f"Epoch {epoch} | loss = {epoch_loss:.4f}")
 
     # ---------------- PREDICT ----------------
     def predict(self, selected_items, filter_out_items, k):
@@ -193,35 +213,29 @@ class NCF(AlgorithmBase, ABC):
             np.union1d(selected_items, list(filter_out_items))
         )
 
-        if len(selected_items) == 0 or len(candidates) == 0:
-            return np.random.choice(
-                candidates if len(candidates) > 0 else np.arange(self._num_items),
-                size=min(k, len(candidates)) if len(candidates) > 0 else k,
-                replace=False
-            ).tolist()
+        if len(candidates) == 0:
+            return []
 
         with torch.no_grad():
 
             cand = torch.tensor(candidates, device=self.device)
             selected = torch.tensor(selected_items, device=self.device)
 
-            # GMF
-            user_gmf = self.gmf_item_emb(selected).mean(dim=0)
-            item_gmf = self.gmf_item_emb(cand)
-            gmf = (user_gmf * item_gmf).sum(dim=1)
+            # 🔥 consistent representation with training (important fix)
+            gmf_u = self.gmf_item_emb(selected).mean(dim=0, keepdim=True)
+            mlp_u = self.mlp_item_emb(selected).mean(dim=0, keepdim=True)
 
-            # MLP
-            user_mlp = self.mlp_item_emb(selected).mean(dim=0)
-            item_mlp = self.mlp_item_emb(cand)
+            gmf_i = self.gmf_item_emb(cand)
+            mlp_i = self.mlp_item_emb(cand)
 
-            mlp_in = torch.cat([
-                user_mlp.unsqueeze(0).expand(len(cand), -1),
-                item_mlp
-            ], dim=1)
+            scores = self.score(
+                gmf_u.expand(len(cand), -1),
+                gmf_i,
+                mlp_u.expand(len(cand), -1),
+                mlp_i
+            )
 
-            mlp = self.mlp(mlp_in).squeeze(-1)
-
-            scores = gmf + mlp
+            scores = torch.sigmoid(scores)
 
             topk = torch.topk(scores, k=min(k, len(candidates))).indices.cpu().numpy()
 
