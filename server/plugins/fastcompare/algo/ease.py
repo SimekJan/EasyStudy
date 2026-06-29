@@ -20,6 +20,9 @@ class EASE(AlgorithmBase, ABC):
     """
 
     def __init__(self, loader, positive_threshold, l2, **kwargs):
+
+        print("_____INITIALIZING_MODEL_____", flush=True)
+
         self._ratings_df = loader.ratings_df
         self._loader = loader
         self._all_items = self._ratings_df.item.unique()
@@ -39,6 +42,9 @@ class EASE(AlgorithmBase, ABC):
 
     # One-time fitting of the algorithm for a predefined number of iterations
     def fit(self):
+
+        print("_____TRAINING_____", flush=True)
+
         X = np.where(self._rating_matrix >= self._threshold, 1, 0).astype(np.float32)
 
         # Compute Gram matrix (G = X^T @ X)
@@ -57,6 +63,9 @@ class EASE(AlgorithmBase, ABC):
 
     # Predict for the user
     def predict(self, selected_items, filter_out_items, k):
+
+        print("_____PREDICTING_____", flush=True)
+
         rat = pd.DataFrame({"item": selected_items}).set_index("item", drop=False)
         # Appropriately filter out what was seen and what else should be filtered
         candidates = np.setdiff1d(self._all_items, rat.item.unique())

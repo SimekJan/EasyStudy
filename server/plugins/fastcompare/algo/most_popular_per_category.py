@@ -13,14 +13,14 @@ from plugins.fastcompare.algo.algorithm_base import (
 
 class MostPopularPerCategory(AlgorithmBase):
     def __init__(self, loader, positive_threshold=2.5, **kwargs):
+
+        print("_____INITIALIZING_MODEL_____", flush=True)
+
         self._categories = loader.get_all_categories()
         self._item_index_categories = loader.get_item_index_categories
         self._ratings_df = loader.ratings_df
         self._loader = loader
         self._all_items = self._ratings_df.item.unique()
-
-        print("Categories:", self._categories)
-        print("Item index categories:", self._item_index_categories(5))
 
         self._rating_matrix = (
             self._loader.ratings_df
@@ -29,21 +29,18 @@ class MostPopularPerCategory(AlgorithmBase):
             .values
         )
 
-        print("Matrix:", self._rating_matrix)
-
         self._popularity = np.sum(self._rating_matrix > 2.5, axis=0)
-        print("Popularity:", self._popularity)
-
         self._category_to_items = defaultdict(list)
 
         for i in range(len(self._popularity)):
             categories = self._item_index_categories(i)
             for c in categories:
                 self._category_to_items[c].append(i)
-        
-        print("Category to items:", self._category_to_items)
 
     def fit(self):
+
+        print("_____TRAINING_____", flush=True)
+
         pass
 
     def get_best_item_by_category(self, category):
@@ -56,6 +53,11 @@ class MostPopularPerCategory(AlgorithmBase):
         return self._all_items[best_idx], self._popularity[best_idx]
 
     def predict(self, selected_items, filter_out_items, k):
+
+        print("_____PREDICTING_____", flush=True)
+        print("Selected items: ", flush=True)
+        for item in selected_items:
+            print(item, flush=True)
 
         selected_set = set(selected_items)
         filter_set = set(filter_out_items)
